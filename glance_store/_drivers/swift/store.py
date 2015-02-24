@@ -19,6 +19,7 @@ import hashlib
 import httplib
 import logging
 import math
+import six
 
 from oslo.config import cfg
 from oslo.utils import excutils
@@ -601,6 +602,13 @@ class BaseStore(driver.Store):
             LOG.error(msg)
             raise glance_store.BackendException(msg)
 
+    def _is_slo(self, slo_header):
+        if (slo_header is not None and isinstance(slo_header, six.string_types)
+                and slo_header.lower() == 'true'):
+            return True
+
+        return False
+
     @capabilities.check
     def delete(self, location, connection=None, context=None):
         location = location.store_location
@@ -612,17 +620,27 @@ class BaseStore(driver.Store):
             # that means the object was uploaded in chunks/segments,
             # and we need to delete all the chunks as well as the
             # manifest.
-            manifest = None
+            dlo_manifest = None
+            slo_manifest = None
             try:
                 headers = connection.head_object(
                     location.container, location.obj)
-                manifest = headers.get('x-object-manifest')
+                dlo_manifest = headers.get('x-object-manifest')
+                slo_manifest = headers.get('x-static-large-object')
             except swiftclient.ClientException as e:
                 if e.http_status != httplib.NOT_FOUND:
                     raise
-            if manifest:
+
+            if self._is_slo(slo_manifest):
+                # Delete the manifest as well as the segments
+                query_string = 'multipart-manifest=delete'
+                connection.delete_object(location.container, location.obj,
+                                         query_string=query_string)
+                return
+
+            if dlo_manifest:
                 # Delete all the chunks before the object manifest itself
-                obj_container, obj_prefix = manifest.split('/', 1)
+                obj_container, obj_prefix = dlo_manifest.split('/', 1)
                 segments = connection.get_container(
                     obj_container, prefix=obj_prefix)[1]
                 for segment in segments:
