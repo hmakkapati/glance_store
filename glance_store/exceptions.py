@@ -92,6 +92,10 @@ class StorageWriteDenied(GlanceStoreException):
     message = _("Permission to write image storage media denied.")
 
 
+class StorageWriteFailed(GlanceStoreException):
+    message = _("Write to storage media failed")
+
+
 class AuthBadRequest(GlanceStoreException):
     message = _("Connect error/bad request to Auth service at URL %(url)s.")
 

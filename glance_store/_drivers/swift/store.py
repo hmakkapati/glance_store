@@ -15,6 +15,7 @@
 
 """Storage backend for SWIFT"""
 
+import eventlet
 import hashlib
 import logging
 import math
@@ -41,6 +42,7 @@ from glance_store import location
 _ = i18n._
 LOG = logging.getLogger(__name__)
 _LI = i18n._LI
+_LW = i18n._LW
 
 DEFAULT_CONTAINER = 'glance'
 DEFAULT_LARGE_OBJECT_SIZE = 5 * units.Ki  # 5GB
@@ -117,7 +119,17 @@ _SWIFT_OPTS = [
                        'compressed format, eg qcow2.')),
     cfg.IntOpt('swift_store_retry_get_count', default=0,
                help=_('The number of times a Swift download will be retried '
-                      'before the request fails.'))
+                      'before the request fails.')),
+    cfg.IntOpt('swift_store_retry_upload_threshold', default=0,
+               min=0, max=65535,
+               help=_('The number of seconds after which an upload to Swift'
+                      'will be re-tried.')),
+    cfg.IntOpt('swift_store_retry_upload_cnt', default=0,
+               min=0, max=65535,
+               help=_('The number of times an upload to Swift will be '
+                      're-tried. The interval between each re-try can be '
+                      'specified using the config option '
+                      'swift_store_retry_upload_threshold'))
 ]
 
 
@@ -414,6 +426,8 @@ class BaseStore(driver.Store):
         self.insecure = glance_conf.swift_store_auth_insecure
         self.ssl_compression = glance_conf.swift_store_ssl_compression
         self.cacert = glance_conf.swift_store_cacert
+        self.upload_threshold = glance_conf.swift_store_retry_upload_threshold
+        self.upload_retries = glance_conf.swift_store_retry_upload_cnt
         super(BaseStore, self).configure(re_raise_bsc=re_raise_bsc)
 
     def _get_object(self, location, connection=None, start=None, context=None):
@@ -490,6 +504,62 @@ class BaseStore(driver.Store):
                 LOG.exception(msg % {'container': container,
                                      'chunk': chunk})
 
+    def _upload_object_with_retry(self, connection, container, obj,
+                                  content=None, content_length=None,
+                                  headers=None):
+        is_retryable = False
+        if getattr(content, 'seek', None):
+            is_retryable = True
+
+        kwargs = {}
+        if content_length:
+            kwargs['content_length'] = content_length
+        if headers:
+            kwargs['headers'] = headers
+
+        # Can't retry or don't retry
+        if not is_retryable or self.upload_retries == 0:
+            return connection.put_object(container, obj, content, **kwargs)
+        else:
+            retrying = False
+            cnt = 1
+            while cnt <= self.upload_retries:
+                msg = "Uploading object %s to Swift. Attempt %s/%s"
+                msg = msg % (obj, cnt, self.upload_retries)
+                LOG.debug(msg)
+
+                if retrying:
+                    content.seek(0)
+
+                gthread = eventlet.greenthread.spawn(connection.put_object,
+                                                     container, obj, content,
+                                                     **kwargs)
+                eventlet.sleep(self.upload_threshold)
+
+                # if the green thread is done
+                if not bool(gthread) and gthread.dead:
+                    msg = "Attempt %s/%s to upload object %s is successful"
+                    msg = msg % (cnt, self.upload_retries, obj)
+                    LOG.debug(msg)
+                    return gthread.wait()
+                else:
+                    msg = ("Attempt %s/%s to upload object %s failed after "
+                           "taking longer than %s seconds. "
+                           "Retries remaining: %s")
+                    msg = msg % (cnt, self.upload_retries, obj,
+                                 self.upload_threshold,
+                                 self.upload_retries - cnt)
+                    LOG.debug(msg)
+                    gthread.kill()
+                    retrying = True
+                    cnt += 1
+
+            if cnt == self.upload_retries:
+                LOG.warn(_LW("Failed to upload object %s after %s attempts.") %
+                         (obj, cnt))
+                raise exceptions.StorageWriteFailed
+
+
     @capabilities.check
     def add(self, image_id, image_file, image_size,
             connection=None, context=None):
@@ -505,9 +575,12 @@ class BaseStore(driver.Store):
             if image_size > 0 and image_size < self.large_object_size:
                 # Image size is known, and is less than large_object_size.
                 # Send to Swift with regular PUT.
-                obj_etag = connection.put_object(location.container,
-                                                 location.obj, image_file,
-                                                 content_length=image_size)
+                obj_etag = self._upload_object_with_retry(connection,
+                                                          location.container,
+                                                          location.obj,
+                                                          image_file,
+                                                          content_length=
+                                                          image_size)
             else:
                 # Write the image into Swift in chunks.
                 chunk_id = 1
@@ -541,9 +614,13 @@ class BaseStore(driver.Store):
                     chunk_name = "%s-%05d" % (location.obj, chunk_id)
                     reader = ChunkReader(image_file, checksum, chunk_size)
                     try:
-                        chunk_etag = connection.put_object(
-                            location.container, chunk_name, reader,
-                            content_length=content_length)
+                        container = location.container
+                        chunk_etag = self._upload_object_with_retry(connection,
+                                                                    container,
+                                                                    chunk_name,
+                                                                    reader,
+                                                                    content_length=
+                                                                    content_length)
                         written_chunks.append(chunk_name)
                     except Exception:
                         # Delete orphaned segments from swift backend

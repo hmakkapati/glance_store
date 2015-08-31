@@ -115,6 +115,8 @@ class OptsTestCase(base.StoreBaseTest):
             'swift_store_service_type',
             'swift_store_ssl_compression',
             'swift_store_user',
+            'swift_store_retry_upload_threshold',
+            'swift_store_retry_upload_cnt',
             'vmware_api_insecure',
             'vmware_api_retry_count',
             'vmware_datacenter_path',
